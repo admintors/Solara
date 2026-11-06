@@ -26,7 +26,7 @@ function issueClientRateLimit(key, max, windowMs, res) {
     throw new HttpError(429, 'RATE_LIMITED', '请求过于频繁，请稍后重试');
   }
 }
-function address(req) { return String(req.socket?.remoteAddress || 'unknown').slice(0, 80); }
+function address(req) { return String(req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 80); }
 async function makePasswordHash(password) {
   try { return await hashPassword(password); }
   catch (error) {
@@ -66,9 +66,12 @@ module.exports = function createAuthRouter(database = getDb(), requireSession) {
     const username = validateUsername(req.body.username);
     if (typeof req.body.displayName !== 'string' || typeof req.body.deviceId !== 'string') throw new HttpError(400, 'REGISTER_FIELDS_INVALID', '注册信息不完整');
     validatePassword(req.body.password);
+    issueClientRateLimit('register-ip:' + address(req), 20, 60 * 60 * 1000, res);
+    if (typeof req.body.inviteToken !== 'string' || !req.body.inviteToken) throw new HttpError(400, 'INVITE_INVALID', '邀请链接无效或已过期');
+    const preview = database.prepare("SELECT id FROM auth_tokens WHERE token_hash=? AND purpose='invite' AND used_at IS NULL AND revoked_at IS NULL AND expires_at>?").get(digest(req.body.inviteToken), Date.now());
+    if (!preview) throw new HttpError(400, 'INVITE_INVALID', '邀请链接无效或已过期');
     const passwordHash = await makePasswordHash(req.body.password);
     let sessionRecord; const now = Date.now();
-    if (typeof req.body.inviteToken !== 'string' || !req.body.inviteToken) throw new HttpError(400, 'INVITE_INVALID', '邀请链接无效或已过期');
     let user;
     transaction(db => {
       const invite = db.prepare("SELECT * FROM auth_tokens WHERE token_hash=? AND purpose='invite' AND used_at IS NULL AND revoked_at IS NULL AND expires_at>?").get(digest(req.body.inviteToken), now);
@@ -114,6 +117,7 @@ module.exports = function createAuthRouter(database = getDb(), requireSession) {
   router.post('/reset-password', asyncRoute(async (req, res) => {
     checkOrigin(req); requireJson(req); sessionHeaders(res);
     ensureAllowedBody(req.body, ['token', 'password']);
+    issueClientRateLimit('reset-ip:' + address(req), 10, 15 * 60 * 1000, res);
     if (typeof req.body.token !== 'string') throw new HttpError(400, 'RESET_TOKEN_INVALID', '重置链接无效或已过期');
     validatePassword(req.body.password);
     const passwordHash = await makePasswordHash(req.body.password), now = Date.now();

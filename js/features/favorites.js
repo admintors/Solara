@@ -8,6 +8,10 @@ import { resetPlayerToIdle } from "../core/audio.js";
 import { showNotification } from "./settings.js";
 import { safeSetLocalStorage } from "../core/storage.js";
 
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' })[char]);
+}
+
 export function ensureFavoriteSongsArray(state) {
     if (!Array.isArray(state.favoriteSongs)) {
         state.favoriteSongs = [];
@@ -165,12 +169,14 @@ export function renderFavorites(state, dom) {
             ? song.artist.join(", ")
             : (song.artist || "未知艺术家");
         const isCurrent = state.currentList === "favorite" && index === state.currentFavoriteIndex;
-        const songKey = getSongKey(song) || `favorite-${index}`;
+        const songKey = escapeHtml(getSongKey(song) || `favorite-${index}`);
+        const songName = escapeHtml(song?.name || '未知歌曲');
+        const safeArtist = escapeHtml(artistValue);
         return `
-        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
+        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${songName}" data-favorite-key="${songKey}">
             <div class="playlist-item-info">
-                <span class="playlist-item-title">${song.name}</span>
-                <span class="playlist-item-artist"> - ${artistValue}</span>
+                <span class="playlist-item-title">${songName}</span>
+                <span class="playlist-item-artist"> - ${safeArtist}</span>
             </div>
             <div class="playlist-item-actions" role="toolbar" aria-label="歌曲操作">
                 <button class="favorite-item-action favorite-item-action--add" type="button" data-favorite-action="add" data-index="${index}" title="添加到播放列表" aria-label="添加到播放列表">

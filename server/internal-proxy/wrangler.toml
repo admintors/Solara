@@ -1,0 +1,3 @@
+name = "solara-internal-music-proxy"
+compatibility_date = "2026-11-06"
+send_metrics = false

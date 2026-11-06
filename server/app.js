@@ -3,8 +3,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
+const net = require('node:net');
 const { getDb } = require('./db');
-const { createSessionMiddleware } = require('./security');
+const { createSessionMiddleware, rateLimitMiddleware } = require('./security');
 const createAuthRouter = require('./routes/auth');
 const createAdminRouter = require('./routes/admin');
 const createUserRouter = require('./routes/user');
@@ -13,11 +14,23 @@ const createPaletteRouter = require('./routes/palette');
 const { HttpError, fail } = require('./http-error');
 
 const ROOT_DIR = path.join(__dirname, '..');
+function trustedProxyRanges(value = process.env.TRUSTED_PROXY_CIDRS || '') {
+  const ranges = value.split(',').map(item => item.trim()).filter(Boolean);
+  for (const range of ranges) {
+    const [address, prefix, extra] = range.split('/');
+    const family = net.isIP(address);
+    const bits = prefix == null ? (family === 4 ? 32 : family === 6 ? 128 : -1) : Number(prefix);
+    if (!family || extra != null || !Number.isInteger(bits) || bits < 0 || bits > (family === 4 ? 32 : 128)) {
+      throw new Error('TRUSTED_PROXY_CIDRS contains an invalid IP/CIDR');
+    }
+  }
+  return ranges.length ? ranges : false;
+}
 function createApp(options = {}) {
   const database = options.database || getDb();
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', false);
+  app.set('trust proxy', trustedProxyRanges());
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'same-origin');
@@ -72,10 +85,13 @@ function createApp(options = {}) {
     res.set('Cache-Control', 'no-store').sendFile(path.join(ROOT_DIR, 'admin.html'));
   }));
 
-  app.use('/api/me', requireSession, createUserRouter(database));
-  app.use('/api/admin', requireSession, createAdminRouter(database));
+  const userApiLimit = rateLimitMiddleware({ key: req => 'api-user:' + req.user.id, max: Number(process.env.USER_API_PER_MINUTE || 120), windowMs: 60000 });
+  const adminApiLimit = rateLimitMiddleware({ key: req => 'api-admin:' + req.user.id, max: Number(process.env.ADMIN_API_PER_MINUTE || 120), windowMs: 60000 });
+  const paletteLimit = rateLimitMiddleware({ key: req => 'palette-user:' + req.user.id, max: Number(process.env.PALETTE_PER_MINUTE || 60), windowMs: 60000 });
+  app.use('/api/me', requireSession, userApiLimit, createUserRouter(database));
+  app.use('/api/admin', requireSession, adminApiLimit, createAdminRouter(database));
   app.use('/proxy', requireSession, createProxyRouter());
-  app.use('/palette', requireSession, createPaletteRouter());
+  app.use('/palette', requireSession, paletteLimit, createPaletteRouter());
   app.use('/api/login', (req, res) => res.status(410).set('Cache-Control', 'no-store').json({ error: { code: 'API_UPGRADE_REQUIRED', message: '请使用用户名与邀请制账号登录' } }));
   app.use('/api/storage', requireSession, (req, res) => res.status(410).set('Cache-Control', 'no-store').json({ error: { code: 'API_UPGRADE_REQUIRED', message: '旧版全局存储接口已停用，请使用新版曲库 API' } }));
 

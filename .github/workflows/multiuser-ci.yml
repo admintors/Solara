@@ -1,0 +1,80 @@
+name: Docker multi-user CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Node and SQLite tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install server dependencies
+        run: npm ci --prefix server --ignore-scripts
+      - name: Run automated contracts
+        run: npm test --prefix server
+
+  docker:
+    name: Build and smoke-test Docker image
+    needs: server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --build-arg VCS_REF="$GITHUB_SHA" --tag solara-ci:"$GITHUB_SHA" .
+      - name: Start isolated container
+        run: |
+          mkdir -p "$RUNNER_TEMP/solara-data"
+          sudo chown 1000:1000 "$RUNNER_TEMP/solara-data"
+          docker run --detach --name solara-ci \
+            --publish 127.0.0.1:18787:8787 \
+            --env APP_ENV=development \
+            --env NODE_ENV=development \
+            --env PUBLIC_ORIGIN=http://127.0.0.1:8787 \
+            --volume "$RUNNER_TEMP/solara-data:/data" \
+            solara-ci:"$GITHUB_SHA"
+      - name: Verify protected proxy and initialize admin
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18787/healthz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:18787/healthz
+          docker exec solara-ci node -e '
+          (async () => {
+            const match = require("node:fs").readFileSync("/app/server/internal-proxy/.dev.vars", "utf8").match(/^INTERNAL_PROXY_TOKEN="([^"]+)"$/m);
+            if (!match) throw new Error("internal token missing");
+            let locked = false;
+            for (let i = 0; i < 30; i++) {
+              try {
+                const response = await fetch("http://127.0.0.1:8788/healthz");
+                if (response.status === 401) { locked = true; break; }
+              } catch {}
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            if (!locked) throw new Error("proxy did not reject unauthenticated request");
+            const authorized = await fetch("http://127.0.0.1:8788/healthz", { headers: { Authorization: "Bearer " + match[1] } });
+            if (authorized.status !== 200) throw new Error("proxy rejected its internal token");
+          })().catch(() => process.exit(1));
+          '
+          printf '%s\n' 'ci-only-test-password-2026' | docker exec -i solara-ci node /app/server/cli.js create-admin --username ci-admin --display-name CI
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18787/readyz >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:18787/readyz
+      - name: Remove smoke-test container
+        if: always()
+        run: docker rm --force solara-ci || true

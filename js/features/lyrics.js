@@ -120,9 +120,13 @@ export function scrollToCurrentLyric(element, containerOverride, dom, smooth = t
     }
 }
 
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' })[char]);
+}
+
 export function displayLyrics(state, dom) {
     const lyricsHtml = state.lyricsData.map((lyric, index) =>
-        `<div data-time="${lyric.time}" data-index="${index}">${lyric.text}</div>`
+        `<div data-time="${Number(lyric.time) || 0}" data-index="${index}">${escapeHtml(lyric.text)}</div>`
     ).join("");
     setLyricsContentHtml(lyricsHtml, dom);
     if (dom.lyrics) {

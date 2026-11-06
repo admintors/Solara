@@ -1,64 +1,53 @@
 #!/bin/sh
-set -e
+set -eu
 
-DEV_VARS="/app/.dev.vars"
+APP_ENV="${APP_ENV:-production}"
+DATA_DIR="${DATA_DIR:-/data}"
+DB_PATH="${DB_PATH:-${DATA_DIR}/solara-multiuser.db}"
+API_BASE_URL="${API_BASE_URL:-https://music-api.gdstudio.xyz/api.php}"
+export APP_ENV NODE_ENV="${NODE_ENV:-$APP_ENV}" DATA_DIR DB_PATH API_BASE_URL
 
-# ── 清空并重建 .dev.vars（wrangler pages dev 从此文件读取 env.*）─────────────
-: > "$DEV_VARS"
+if [ "$APP_ENV" != "production" ] && [ "$APP_ENV" != "development" ]; then
+  echo "APP_ENV must be production or development" >&2
+  exit 1
+fi
+if [ -z "${PUBLIC_ORIGIN:-}" ]; then
+  echo "PUBLIC_ORIGIN is required; set the public HTTPS origin in .env" >&2
+  exit 1
+fi
 
-write_var() {
-  _name="$1"
-  _value="$2"
-  if [ -n "$_value" ]; then
-    printf '%s="%s"\n' "$_name" "$_value" >> "$DEV_VARS"
-    echo "  [env] $_name = configured"
-  fi
+if ! mkdir -p "$DATA_DIR/backups" "$DATA_DIR/imports" 2>/dev/null || [ ! -w "$DATA_DIR" ]; then
+  echo "DATA_DIR is not writable by uid $(id -u): $DATA_DIR" >&2
+  echo "For a bind mount, prepare it on the host with: install -d -o 1000 -g 1000 ./data ./data/backups ./data/imports" >&2
+  exit 1
+fi
+
+node -e '
+  let origin, api;
+  try { origin = new URL(process.env.PUBLIC_ORIGIN || ""); api = new URL(process.env.API_BASE_URL || ""); } catch { process.exit(1); }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname);
+  if (origin.origin !== process.env.PUBLIC_ORIGIN ||
+      (process.env.APP_ENV === "production" && origin.protocol !== "https:") ||
+      (origin.protocol === "http:" && !local) ||
+      api.protocol !== "https:" || api.username || api.password || /[\r\n"]/u.test(process.env.API_BASE_URL || "")) process.exit(1);
+' || {
+  echo "PUBLIC_ORIGIN or API_BASE_URL is invalid for APP_ENV" >&2
+  exit 1
 }
+INTERNAL_PROXY_TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))')"
+export INTERNAL_PROXY_TOKEN
+umask 077
+DEV_VARS="/app/server/internal-proxy/.dev.vars"
+printf 'INTERNAL_PROXY_TOKEN="%s"\nAPI_BASE_URL="%s"\n' "$INTERNAL_PROXY_TOKEN" "$API_BASE_URL" > "$DEV_VARS"
+chmod 0600 "$DEV_VARS"
 
-echo "Configuring environment variables for wrangler..."
+cd /app/server/internal-proxy
+./node_modules/.bin/wrangler pages dev ./public --ip 127.0.0.1 --port 8788 --log-level error >/dev/null 2>&1 &
+PROXY_PID=$!
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  echo "Internal music proxy failed to start; readiness will remain unavailable" >&2
+  exit 1
+fi
 
-# 登录密码（_middleware.ts 读取 env.PASSWORD）
-write_var "PASSWORD" "$PASSWORD"
-
-# 音乐 API 地址（functions/proxy.ts 读取 env.API_BASE_URL，未配置时 fallback 到默认节点）
-write_var "API_BASE_URL" "$API_BASE_URL"
-
-# i18n 语言设置（_middleware.ts 读取 env.language / env.LANGUAGE）
-# 支持两种写法：language=ENG 或 LANGUAGE=ENG
-_LANG_VALUE="${language:-${LANGUAGE:-}}"
-write_var "language" "$_LANG_VALUE"
-
-# ── 确保 D1 持久化目录存在 ────────────────────────────────────────────────────
-mkdir -p /data
-chmod 755 /data
-
-# ── 打印启动信息 ───────────────────────────────────────────────────────────────
-echo ""
-echo "  🌟 Solara  (Cloudflare Pages + Wrangler local dev)"
-echo "  ────────────────────────────────────────────────────"
-echo "  Port      : 8787"
-echo "  Data dir  : /data"
-echo "  Password  : ${PASSWORD:+configured}${PASSWORD:-not set (open access)}"
-echo "  API URL   : ${API_BASE_URL:-https://music-api.gdstudio.xyz/api.php (default)}"
-echo "  Language  : ${_LANG_VALUE:-ZH (default)}"
-echo "  ────────────────────────────────────────────────────"
-echo ""
-
-# ── 启动 wrangler pages dev 监听本地 8788 端口 ───────────────────────────────
-echo "Starting wrangler pages dev in background on port 8788..."
-wrangler pages dev . \
-  --ip 127.0.0.1 \
-  --port 8788 \
-  --d1 DB \
-  --persist-to=/data > /tmp/wrangler.log 2>&1 &
-
-sleep 2
-
-# ── 启动 Node.js 独立服务器监听 8787 端口 ──────────────────────────────────────
-echo "Starting Node.js standalone server on port 8787..."
-export PORT=8787
-export HOST=0.0.0.0
-export DATA_DIR=/data
-export WRANGLER_API_URL=http://127.0.0.1:8788
-
-exec node server/index.js
+exec node /app/server/index.js

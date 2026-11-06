@@ -1,0 +1,7 @@
+{
+  "name": "solara-internal-music-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": "22.23.4" },
+  "dependencies": { "wrangler": "4.157.0" }
+}

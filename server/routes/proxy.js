@@ -75,7 +75,7 @@ function createProxyRouter() {
           Accept: isAudio ? '*/*' : 'application/json',
         },
         redirect: 'manual',
-        signal: controller.signal,
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(isAudio ? 30000 : 10000)]),
       });
       res.status(upstream.status);
       for (const name of ['content-type','content-length','content-range','accept-ranges','etag','last-modified']) {

@@ -4,11 +4,13 @@
 
 ## 首次部署与管理员
 
-在仓库目录准备 .env：
+先复制配置模板并编辑公开 HTTPS 地址；数据库卷由容器中的 uid 1000 使用：
 
-    APP_ENV=production
-    PUBLIC_ORIGIN=https://music.example.com
-    API_BASE_URL=https://music-api.gdstudio.xyz/api.php
+    cp .env.example .env
+    # 将 PUBLIC_ORIGIN 改为反向代理对外提供的 HTTPS 地址
+    install -d -o 1000 -g 1000 ./data ./data/backups ./data/imports
+
+可选地设置音乐 API 地址。只有当反向代理来源地址固定且明确时，才在 .env 中填写 TRUSTED_PROXY_CIDRS。Compose 默认只把服务绑定到本机 127.0.0.1:8080，供现有反向代理连接。
 
 启动容器后先创建数据库，再交互式创建首位管理员。密码通过终端隐藏输入，不要把密码放进命令参数或环境文件。
 
@@ -23,7 +25,10 @@
 迁移前停止旧容器，留存完整 /data 目录副本。不要让旧版和新版同时写同一个数据目录。新版使用 /data/solara-multiuser.db，旧的 /data/solara.db 只作为来源，不会被自动认领。
 
     docker compose stop solara
-    # 将原 data 目录做文件系统级副本并保留原目录
+    cp -a ./data ./data.pre-multiuser
+    # 先确认 .env 中的 PUBLIC_ORIGIN，再准备新镜像使用的宿主机数据目录
+    cp .env.example .env
+    install -d -o 1000 -g 1000 ./data ./data/backups ./data/imports
     docker compose up -d --build
     docker compose exec solara node /app/server/cli.js init-db
     docker compose exec solara node /app/server/cli.js create-admin --username admin --display-name 管理员
