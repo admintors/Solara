@@ -1,225 +1,120 @@
-/**
- * 代理接口 —— 移植自 functions/proxy.ts
- * GET /proxy
- *
- * 核心缓存逻辑与 Cloudflare 版完全一致：
- *   - Cache HIT  → 直接返回缓存内容，不请求上游
- *   - Cache MISS → 请求上游，成功后写入本地内存缓存（5 分钟 TTL）
- *   - 搜索结果为空 / 包含错误 → 不缓存
- */
+'use strict';
 
 const { Router } = require('express');
-const cache = require('../cache');
+const { Readable } = require('node:stream');
+const { rateLimit } = require('../security');
+const { HttpError } = require('../http-error');
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://music-api.gdstudio.xyz/api.php';
-const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
+const ALLOWED_QUERY = new Set(['types','source','id','name','artist','album','br','format','keyword','page','count','limit','offset','word','mid','sid','pic_id','lyric_id','target','nocache','s']);
+const ALLOWED_TYPES = new Set(['search','url','song','lyric','pic','playlist','toplist','artist','album','detail','mv','lrc']);
+const SOURCES = new Set(['netease','kuwo','bilibili']);
+const activeAudio = new Map();
 
-const SAFE_RESPONSE_HEADERS = [
-  'content-type', 'cache-control', 'accept-ranges',
-  'content-length', 'content-range', 'etag', 'last-modified', 'expires',
-];
-
-function isAllowedKuwoHost(hostname) {
-  return hostname && KUWO_HOST_PATTERN.test(hostname);
-}
-
-function buildCacheKey(url) {
-  // 过滤随机防缓存签名 s 以及 nocache 参数，以便重试成功后能更新同一个缓存项
-  const u = new URL(url);
-  u.searchParams.delete('s');
-  u.searchParams.delete('nocache');
-  return u.toString();
-}
-
-/** 代理酷我音频流（带 Range 支持） */
-async function proxyKuwoAudio(targetUrl, req, res) {
-  let parsed;
-  try {
-    parsed = new URL(targetUrl);
-  } catch {
-    return res.status(400).send('Invalid target');
+function validateQuery(req) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(req.query)) {
+    if (!ALLOWED_QUERY.has(key) || Array.isArray(value) || typeof value !== 'string' || value.length > 2048) throw new HttpError(400, 'PROXY_QUERY_INVALID', '音乐请求参数无效');
+    params.set(key, value);
   }
-
-  if (!isAllowedKuwoHost(parsed.hostname)) {
-    return res.status(400).send('Invalid target');
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return res.status(400).send('Invalid target');
-  }
-  parsed.protocol = 'http:';
-
-  const headers = {
-    'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
-    'Referer': 'https://www.kuwo.cn/',
-  };
-  if (req.headers['range']) headers['Range'] = req.headers['range'];
-
-  const controller = new AbortController();
-  req.on('close', () => {
-    controller.abort();
-  });
-
-  try {
-    const upstream = await fetch(parsed.toString(), {
-      method: req.method,
-      headers,
-      signal: controller.signal
-    });
-    res.status(upstream.status);
-
-    for (const h of SAFE_RESPONSE_HEADERS) {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h, v);
-    }
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-
-    const { Readable } = require('node:stream');
-    return Readable.fromWeb(upstream.body).pipe(res);
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      console.log('[Proxy Kuwo] Request aborted by client');
-      return;
-    }
-    console.error('[Proxy Kuwo]', err);
-    return res.status(502).send('Upstream error');
-  }
-}
-
-/** 代理 music API 请求，带本地缓存 */
-async function proxyApiRequest(reqUrl, req, res) {
-  const cacheKey = buildCacheKey(reqUrl);
-  const parsedReq = new URL(reqUrl);
-  const bypassCache = parsedReq.searchParams.get('nocache') === 'true';
-
-  // ── Cache HIT ──────────────────────────────────────────────────────────────
-  if (!bypassCache) {
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      console.log(`[Cache HIT] ${reqUrl}`);
-      res.setHeader('Content-Type', cached.contentType || 'application/json');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('X-Cache-Status', 'HIT');
-      res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status');
-      return res.send(cached.body);
-    }
-  }
-
-  // ── Cache MISS：请求上游 ────────────────────────────────────────────────────
-  console.log(`[Cache MISS] Fetching from upstream: ${reqUrl}`);
-
-  let upstream;
-  let responseText;
-  let contentType;
-
-  if (process.env.WRANGLER_API_URL) {
-    // 转发给内部 Wrangler，利用其 BoringSSL 绕过 Cloudflare 验证
-    const wranglerUrl = new URL(process.env.WRANGLER_API_URL + '/proxy');
-    parsedReq.searchParams.forEach((value, key) => {
-      if (key === 'target' || key === 'callback' || key === 's' || key === 'nocache') return;
-      wranglerUrl.searchParams.set(key, value);
-    });
-
-    const fetchHeaders = {
-      'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
-      'Accept': 'application/json',
-    };
-    if (process.env.PASSWORD) {
-      fetchHeaders['Cookie'] = `auth=${Buffer.from(process.env.PASSWORD).toString('base64')}`;
-    } else if (req.headers.cookie) {
-      fetchHeaders['Cookie'] = req.headers.cookie;
-    }
-
-    try {
-      upstream = await fetch(wranglerUrl.toString(), {
-        headers: fetchHeaders,
-        redirect: 'manual',
-      });
-      // 若出现重定向（如未授权重定向到登录页），说明认证异常，禁止将 HTML 作为 JSON 返回
-      if (upstream.status >= 300 && upstream.status < 400) {
-        console.error('[Proxy API via Wrangler] Upstream returned redirect status:', upstream.status);
-        return res.status(502).send('Internal auth proxy redirect error');
-      }
-      responseText = await upstream.text();
-      contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
-    } catch (err) {
-      console.error('[Proxy API via Wrangler fetch]', err);
-      return res.status(502).send('Upstream proxy error');
+  if (params.has('source') && !SOURCES.has(params.get('source').toLowerCase())) throw new HttpError(400, 'PROXY_SOURCE_INVALID', '音乐来源不受支持');
+  if (params.has('target')) {
+    let target;
+    try { target = new URL(params.get('target')); } catch { throw new HttpError(400, 'PROXY_TARGET_INVALID', '音频地址无效'); }
+    const host = target.hostname.toLowerCase();
+    if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password || !(host === 'kuwo.cn' || host.endsWith('.kuwo.cn'))) {
+      throw new HttpError(400, 'PROXY_TARGET_REJECTED', '音频目标不受支持');
     }
   } else {
-    // 原逻辑，未配置 WRANGLER_API_URL 时直接 fetch API_BASE_URL
-    const apiUrl = new URL(API_BASE_URL);
-    parsedReq.searchParams.forEach((value, key) => {
-      if (key === 'target' || key === 'callback' || key === 's' || key === 'nocache') return;
-      apiUrl.searchParams.set(key, value);
-    });
-
-    if (!apiUrl.searchParams.has('types')) {
-      return res.status(400).send('Missing types');
-    }
-
-    try {
-      upstream = await fetch(apiUrl.toString(), {
-        headers: {
-          'User-Agent': 'Meting/1.5.0',
-          'Accept': 'application/json',
-        },
-      });
-      responseText = await upstream.text();
-      contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
-    } catch (err) {
-      console.error('[Proxy API fetch]', err);
-      return res.status(502).send('Upstream error');
-    }
+    const type = params.get('types');
+    if (!type || !ALLOWED_TYPES.has(type)) throw new HttpError(400, 'PROXY_TYPE_INVALID', '音乐请求类型不受支持');
   }
-
-  // ── 判断是否缓存（与 Cloudflare 版本逻辑完全一致） ──────────────────────────
-  const isSearch = parsedReq.searchParams.get('types') === 'search';
-  const isEmptyResult = responseText.trim() === '[]';
-  const isError = responseText.includes('"error"') || responseText.includes('"status":0');
-
-  let shouldCache = upstream.status === 200 && !isError && !bypassCache;
-  if (isSearch && isEmptyResult) shouldCache = false;
-
-  if (shouldCache) {
-    cache.set(cacheKey, { body: responseText, contentType }, 300); // 缓存 5 分钟
-    console.log(`[Cache PUT] Saved to cache: ${reqUrl}`);
-  }
-
-  res.setHeader('Content-Type', contentType);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('X-Cache-Status', 'MISS');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Cache-Status');
-  res.setHeader('Cache-Control', shouldCache ? 'public, max-age=300' : 'no-store');
-
-  return res.status(upstream.status).send(responseText);
+  return params;
 }
 
-module.exports = function createProxyRouter() {
+function createProxyRouter() {
   const router = Router();
-
-  router.options('/', (req, res) => {
-    res.status(204)
-      .set({
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Max-Age': '86400',
-      })
-      .end();
-  });
-
-  router.get('/', async (req, res) => {
-    const target = req.query.target;
-
-    if (target) {
-      return proxyKuwoAudio(target, req, res);
+  router.all('/', async (req, res, next) => {
+    let params;
+    try { params = validateQuery(req); } catch (error) { return next(error); }
+    const isAudio = params.has('target');
+    const userId = req.user.id;
+    if (!isAudio && params.get('types') === 'search') {
+      const limit = rateLimit('music-search:' + userId, Number(process.env.SEARCH_PER_MINUTE || 30), 60000);
+      if (!limit.allowed) { res.set('Retry-After', String(limit.retryAfter)); return next(new HttpError(429, 'RATE_LIMITED', '搜索请求过于频繁')); }
     }
+    const count = isAudio ? (activeAudio.get(userId) || 0) : 0;
+    if (isAudio && count >= Number(process.env.AUDIO_STREAMS_PER_USER || 2)) return next(new HttpError(429, 'AUDIO_STREAM_LIMIT', '当前设备的音频连接已达到上限'));
+    if (isAudio) activeAudio.set(userId, count + 1);
 
-    // 重建完整 URL（含查询参数）给缓存 key 使用
-    const fullUrl = `http://localhost${req.originalUrl}`;
-    return proxyApiRequest(fullUrl, req, res);
+    const base = process.env.INTERNAL_PROXY_URL || process.env.WRANGLER_API_URL;
+    const internalToken = process.env.INTERNAL_PROXY_TOKEN;
+    if (!base || !internalToken) {
+      if (isAudio) activeAudio.set(userId, Math.max(0, (activeAudio.get(userId) || 1) - 1));
+      return next(new HttpError(503, 'MUSIC_PROXY_UNAVAILABLE', '音乐代理尚未就绪'));
+    }
+    let target;
+    try {
+      target = new URL('/proxy', base);
+      if (target.protocol !== 'http:' || !['127.0.0.1','localhost','[::1]'].includes(target.hostname)) throw new Error('not-local');
+    } catch {
+      if (isAudio) activeAudio.set(userId, Math.max(0, (activeAudio.get(userId) || 1) - 1));
+      return next(new HttpError(503, 'MUSIC_PROXY_UNAVAILABLE', '内部音乐代理地址无效'));
+    }
+    target.search = params.toString();
+
+    const controller = new AbortController();
+    const closeHandler = () => { if (!res.writableEnded) controller.abort(); };
+    res.once('close', closeHandler);
+    try {
+      const upstream = await fetch(target, {
+        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: {
+          Authorization: 'Bearer ' + internalToken,
+          'User-Agent': req.get('User-Agent') || 'Solara/2',
+          ...(req.get('Range') ? { Range: req.get('Range') } : {}),
+          Accept: isAudio ? '*/*' : 'application/json',
+        },
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      res.status(upstream.status);
+      for (const name of ['content-type','content-length','content-range','accept-ranges','etag','last-modified']) {
+        const value = upstream.headers.get(name);
+        if (value) res.setHeader(name, value);
+      }
+      if (isAudio) res.setHeader('Cache-Control', 'private, no-store');
+      else res.setHeader('Cache-Control', upstream.headers.get('cache-control') || 'public, max-age=300');
+      if (!upstream.body) return res.end();
+      if (isAudio) {
+        Readable.fromWeb(upstream.body).pipe(res);
+        await new Promise(resolve => { res.once('finish', resolve); res.once('close', resolve); });
+      } else {
+        const reader = upstream.body.getReader();
+        const chunks = [];
+        let size = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 2 * 1024 * 1024) {
+            await reader.cancel();
+            throw new HttpError(502, 'UPSTREAM_RESPONSE_TOO_LARGE', '音乐服务响应过大');
+          }
+          chunks.push(Buffer.from(value));
+        }
+        res.end(Buffer.concat(chunks));
+      }
+    } catch (error) {
+      if (!res.headersSent) next(error instanceof HttpError ? error : new HttpError(502, 'MUSIC_PROXY_FAILED', '音乐服务暂时不可用'));
+      else if (!res.writableEnded) res.destroy();
+    } finally {
+      res.removeListener('close', closeHandler);
+      if (isAudio) {
+        const remaining = (activeAudio.get(userId) || 1) - 1;
+        if (remaining > 0) activeAudio.set(userId, remaining); else activeAudio.delete(userId);
+      }
+    }
   });
-
   return router;
-};
+}
+module.exports = createProxyRouter;
