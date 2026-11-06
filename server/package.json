@@ -1,10 +1,12 @@
 {
   "name": "solara-standalone",
   "version": "1.0.0",
-  "description": "Solara 独立 Node.js 服务器（Docker 版，不依赖 Cloudflare/Wrangler）",
+  "description": "Solara Docker multi-user server (Node.js and SQLite)",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "cli": "node cli.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",
