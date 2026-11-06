@@ -106,12 +106,13 @@ function importLegacy(sourcePath, ownerArg, dryRun = false, dbPath = DB_PATH) {
   const database = openDatabase(dbPath);
   try {
     const owner = resolveUser(database, ownerArg || '');
-    if (!owner || owner.role !== 'admin' || owner.status !== 'active') throw new Error('ACTIVE_ADMIN_OWNER_REQUIRED');
+    if (!owner) throw new Error('ACTIVE_ADMIN_OWNER_REQUIRED');
     const prior = database.prepare("SELECT id,user_id,result_json FROM data_imports WHERE source_type='legacy-db' AND source_digest=?").get(digest);
     if (prior) {
       if (prior.user_id !== owner.id) throw new Error('LEGACY_SOURCE_ALREADY_ASSIGNED');
       return { skipped: true, alreadyImported: true, report: JSON.parse(prior.result_json), backup: snapshotPath };
     }
+    if (owner.role !== 'admin' || owner.status !== 'active') throw new Error('ACTIVE_ADMIN_OWNER_REQUIRED');
     const queueRaw = parseLegacy(values.playlistSongs);
     const favoritesRaw = parseLegacy(values.favoriteSongs);
     const queue = Array.isArray(queueRaw) ? queueRaw : [];
