@@ -6,6 +6,7 @@ import { FAVORITE_EXPORT_VERSION } from "../constants.js";
 import { getSongKey, sanitizeImportedSong } from "./playlist.js";
 import { resetPlayerToIdle } from "../core/audio.js";
 import { showNotification } from "./settings.js";
+import { safeSetLocalStorage } from "../core/storage.js";
 
 export function ensureFavoriteSongsArray(state) {
     if (!Array.isArray(state.favoriteSongs)) {
@@ -252,7 +253,8 @@ export function removeFavoriteAtIndex(index, state, dom, callbacks = {}) {
         state.currentFavoriteIndex--;
     }
 
-    if (typeof callbacks.saveFavoriteState === "function") callbacks.saveFavoriteState();
+    safeSetLocalStorage("favoriteSongs", "[]", { skipRemote: true });
+    if (typeof callbacks.saveFavoriteState === "function") callbacks.saveFavoriteState({ skipRemote: true });
     renderFavorites(state, dom);
     if (typeof callbacks.updatePlayModeUI === "function") callbacks.updatePlayModeUI();
     if (typeof callbacks.clearLyricsIfLibraryEmpty === "function") callbacks.clearLyricsIfLibraryEmpty();
@@ -328,10 +330,12 @@ export function addAllFavoritesToPlaylist(state, dom, callbacks = {}) {
     }
 }
 
-export function clearFavorites(state, dom, callbacks = {}) {
+export async function clearFavorites(state, dom, callbacks = {}) {
     const favorites = ensureFavoriteSongsArray(state);
-    if (favorites.length === 0) {
-        return;
+    if (favorites.length === 0) return;
+    if (typeof callbacks.clearRemoteFavorites === "function") {
+        try { await callbacks.clearRemoteFavorites(); }
+        catch (error) { showNotification(error.message || "清空失败，请刷新后重试", "error", dom); return; }
     }
 
     const isPlayingFavorites = state.currentList === "favorite";

@@ -8,7 +8,6 @@ import {
     EXPLORE_RADAR_GENRES,
     RADAR_PLAYLISTS,
     LAST_SEARCH_STATE_STORAGE_KEY,
-    STORAGE_KEYS_TO_SYNC,
     normalizeQuality,
     normalizeSource
 } from "./constants.js";
@@ -18,11 +17,10 @@ import {
     safeSetLocalStorage,
     safeGetLocalStorage,
     parseJSON,
-    persistentStorage,
-    setRemoteSyncEnabled,
-    isRemoteSyncEnabled,
-    syncLocalDataToCloud,
-    preferHttpsUrl
+    preferHttpsUrl,
+    refreshUserLibrary,
+    clearServerQueue,
+    clearServerFavorites
 } from "./core/storage.js";
 import {
     showAlbumCoverPlaceholder,
@@ -74,7 +72,6 @@ import {
     clearPlaylist,
     removeFromPlaylist,
     exportPlaylist,
-    handleImportPlaylistChange,
     updateAllTabsIndicators
 } from "./features/playlist.js";
 import {
@@ -87,8 +84,7 @@ import {
     removeFavoriteAtIndex,
     addAllFavoritesToPlaylist,
     clearFavorites,
-    exportFavorites,
-    handleImportFavoritesChange
+    exportFavorites
 } from "./features/favorites.js";
 import {
     toggleSearchMode,
@@ -125,6 +121,7 @@ import {
     cancelPendingPlayback
 } from "./core/audio.js";
 import { initMediaSession } from "./core/media-session.js";
+import { importLibraryFile } from "./core/library-import.js";
 
 const debugLog = createDebugLogger(state, dom);
 initDebugShortcut(state, dom, debugLog);
@@ -413,6 +410,7 @@ function getAudioCallbacks() {
 function getPlaylistCallbacks() {
     return {
         savePlayerState,
+        clearRemoteQueue: clearServerQueue,
         cancelPendingPlayback: () => cancelPendingPlayback(),
         playPlaylistSong: (idx, opts) => playPlaylistSong(idx, opts),
         setSongAsPending: (song, idx, type) => setSongAsPending(song, idx, type),
@@ -1129,11 +1127,10 @@ function setupEventHandlers() {
         });
     }
     if (dom.importPlaylistInput) {
-        dom.importPlaylistInput.addEventListener("change", (e) => {
-            handleImportPlaylistChange(e, state, dom, {
-                savePlayerState,
-                renderPlaylist: () => renderPlaylist(state, dom, getPlaylistCallbacks())
-            });
+        dom.importPlaylistInput.addEventListener("change", (event) => {
+            const file = event.target.files?.[0];
+            importLibraryFile(file, "queue").catch(error => showNotification(error.message || "导入失败", "error", dom))
+                .finally(() => { event.target.value = ""; });
         });
     }
     if (dom.exportPlaylistBtn) {
@@ -1163,11 +1160,10 @@ function setupEventHandlers() {
         });
     }
     if (dom.importFavoritesInput) {
-        dom.importFavoritesInput.addEventListener("change", (e) => {
-            handleImportFavoritesChange(e, state, dom, {
-                saveFavoriteState,
-                renderFavorites: () => renderFavorites(state, dom)
-            });
+        dom.importFavoritesInput.addEventListener("change", (event) => {
+            const file = event.target.files?.[0];
+            importLibraryFile(file, "favorites").catch(error => showNotification(error.message || "导入失败", "error", dom))
+                .finally(() => { event.target.value = ""; });
         });
     }
     if (dom.exportFavoritesBtn) {
@@ -1177,6 +1173,7 @@ function setupEventHandlers() {
         dom.mobileExportFavoritesBtn.addEventListener("click", () => exportFavorites(state, dom));
     }
     const handleClearFavorites = () => clearFavorites(state, dom, {
+        clearRemoteFavorites: clearServerFavorites,
         saveFavoriteState,
         resetPlayerToIdle: () => resetPlayerToIdle(state, dom, {
             showAlbumCoverPlaceholder: () => showAlbumCoverPlaceholder(dom, state),
@@ -1378,218 +1375,11 @@ window.playPrevious = () => playPrevious(state, dom, getAudioCallbacks());
 window.autoPlayNext = () => autoPlayNext(state, dom, getAudioCallbacks());
 window.restoreLastSearchResults = (options = { showView: true }) => restoreLastSearchResults(state, dom, getSearchCallbacks(), options);
 
-// 从云端 D1 数据库应用快照至本地应用状态与 UI
-export async function applyPersistentSnapshotFromRemote(data) {
-    if (!data || typeof data !== "object") {
-        return false;
-    }
-
-    let playlistUpdated = false;
-    let favoritesUpdated = false;
-
-    if (typeof data.playlistSongs === "string") {
-        const playlist = parseJSON(data.playlistSongs, null);
-        if (Array.isArray(playlist)) {
-            // 如果云端是空的，但本地已有歌曲，保留本地已有歌曲并向云端备份，防止误清空本地
-            if (playlist.length === 0 && Array.isArray(state.playlistSongs) && state.playlistSongs.length > 0) {
-                safeSetLocalStorage("playlistSongs", JSON.stringify(state.playlistSongs));
-            } else {
-                state.playlistSongs = playlist;
-                safeSetLocalStorage("playlistSongs", data.playlistSongs, { skipRemote: true });
-                playlistUpdated = true;
-            }
-        }
-    }
-
-    if (typeof data.favoriteSongs === "string") {
-        const favorites = parseJSON(data.favoriteSongs, null);
-        if (Array.isArray(favorites)) {
-            // 如果云端是空的，但本地已有收藏，保留本地已有收藏并向云端备份
-            if (favorites.length === 0 && Array.isArray(state.favoriteSongs) && state.favoriteSongs.length > 0) {
-                safeSetLocalStorage("favoriteSongs", JSON.stringify(state.favoriteSongs));
-            } else {
-                state.favoriteSongs = favorites;
-                safeSetLocalStorage("favoriteSongs", data.favoriteSongs, { skipRemote: true });
-                favoritesUpdated = true;
-            }
-        }
-    }
-
-    if (typeof data.currentTrackIndex === "string") {
-        const index = Number.parseInt(data.currentTrackIndex, 10);
-        if (Number.isInteger(index)) {
-            state.currentTrackIndex = index;
-            safeSetLocalStorage("currentTrackIndex", data.currentTrackIndex, { skipRemote: true });
-        }
-    }
-
-    if (typeof data.currentFavoriteIndex === "string") {
-        const favoriteIndex = Number.parseInt(data.currentFavoriteIndex, 10);
-        if (Number.isInteger(favoriteIndex)) {
-            state.currentFavoriteIndex = favoriteIndex;
-            safeSetLocalStorage("currentFavoriteIndex", data.currentFavoriteIndex, { skipRemote: true });
-        }
-    }
-
-    if (typeof data.playMode === "string" && ["list", "single", "random"].includes(data.playMode)) {
-        state.playMode = data.playMode;
-        safeSetLocalStorage("playMode", state.playMode, { skipRemote: true });
-    }
-
-    if (typeof data.playbackQuality === "string") {
-        state.playbackQuality = normalizeQuality(data.playbackQuality);
-        safeSetLocalStorage("playbackQuality", state.playbackQuality, { skipRemote: true });
-    }
-
-    if (typeof data.playerVolume === "string") {
-        const volume = Number.parseFloat(data.playerVolume);
-        if (Number.isFinite(volume)) {
-            const clamped = Math.min(Math.max(volume, 0), 1);
-            state.volume = clamped;
-            safeSetLocalStorage("playerVolume", String(clamped), { skipRemote: true });
-            try {
-                if (dom.audioPlayer) dom.audioPlayer.volume = clamped;
-                if (dom.volumeSlider) dom.volumeSlider.value = String(clamped);
-                updateVolumeSliderBackground(dom, clamped);
-                updateVolumeIcon(dom, clamped);
-            } catch (err) {
-                console.warn("更新音量设置失败:", err);
-            }
-        }
-    }
-
-    if (typeof data.currentPlaylist === "string") {
-        state.currentPlaylist = data.currentPlaylist;
-        safeSetLocalStorage("currentPlaylist", data.currentPlaylist, { skipRemote: true });
-    }
-
-    if (typeof data.currentList === "string") {
-        state.currentList = data.currentList === "favorite" ? "favorite" : "playlist";
-        safeSetLocalStorage("currentList", state.currentList, { skipRemote: true });
-    }
-
-    if (typeof data.currentSong === "string" && data.currentSong) {
-        const currentSong = parseJSON(data.currentSong, null);
-        if (currentSong && typeof currentSong === "object") {
-            state.currentSong = currentSong;
-            safeSetLocalStorage("currentSong", data.currentSong, { skipRemote: true });
-        }
-    }
-
-    if (typeof data.currentPlaybackTime === "string") {
-        const playbackTime = Number.parseFloat(data.currentPlaybackTime);
-        if (Number.isFinite(playbackTime) && playbackTime >= 0) {
-            state.currentPlaybackTime = playbackTime;
-            safeSetLocalStorage("currentPlaybackTime", data.currentPlaybackTime, { skipRemote: true });
-        }
-    }
-
-    if (typeof data.favoritePlayMode === "string" && ["list", "single", "random"].includes(data.favoritePlayMode)) {
-        state.favoritePlayMode = data.favoritePlayMode;
-        safeSetLocalStorage("favoritePlayMode", state.favoritePlayMode, { skipRemote: true });
-    }
-
-    if (typeof data.favoritePlaybackTime === "string") {
-        const favTime = Number.parseFloat(data.favoritePlaybackTime);
-        if (Number.isFinite(favTime) && favTime >= 0) {
-            state.favoritePlaybackTime = favTime;
-            safeSetLocalStorage("favoritePlaybackTime", data.favoritePlaybackTime, { skipRemote: true });
-        }
-    }
-
-    if (typeof data.searchSource === "string") {
-        state.searchSource = normalizeSource(data.searchSource);
-        safeSetLocalStorage("searchSource", state.searchSource, { skipRemote: true });
-        updateSourceLabel(state, dom);
-        buildSourceMenu(state, dom);
-    }
-
-    if (typeof data[LAST_SEARCH_STATE_STORAGE_KEY] === "string" && data[LAST_SEARCH_STATE_STORAGE_KEY]) {
-        safeSetLocalStorage(LAST_SEARCH_STATE_STORAGE_KEY, data[LAST_SEARCH_STATE_STORAGE_KEY], { skipRemote: true });
-    }
-
-    if (typeof data.radarSettings === "string") {
-        const radarSettings = parseJSON(data.radarSettings, null);
-        if (radarSettings) {
-            state.radarSettings = radarSettings;
-            safeSetLocalStorage("radarSettings", data.radarSettings, { skipRemote: true });
-            applySettingsToUI(dom, state);
-        }
-    }
-
-    // 重新校准状态自洽
-    validateStateConsistency(dom, {
-        debugLog,
-        showAlbumCoverPlaceholder: () => showAlbumCoverPlaceholder(dom, state),
-        updatePlayPauseButton: () => updatePlayPauseButton(dom)
-    });
-
-    // 刷新 UI 渲染
-    if (playlistUpdated) {
-        renderPlaylist(state, dom, getPlaylistCallbacks());
-    }
-    if (favoritesUpdated) {
-        renderFavorites(state, dom);
-    }
-    updateFavoriteIcons(state, dom);
-    updatePlayModeUI(state, dom);
-    updateQualityLabel(state, dom);
-    updatePlayPauseButton(dom);
-
-    // 恢复当前歌曲与封面
-    if (state.currentSong) {
-        const savedTime = state.currentList === "favorite"
-            ? (state.favoritePlaybackTime || 0)
-            : (state.currentPlaybackTime || 0);
-
-        if (dom.progressBar) {
-            dom.progressBar.value = savedTime;
-        }
-        if (dom.currentTimeDisplay) {
-            dom.currentTimeDisplay.textContent = formatTime(savedTime);
-        }
-        updateProgressBarBackground(dom, savedTime, Number(dom.progressBar?.max || 1));
-
-        try {
-            await playSong(state.currentSong, {
-                autoplay: false,
-                startTime: savedTime,
-                preserveProgress: true
-            }, state, dom, getAudioCallbacks(), debugLog);
-        } catch (err) {
-            console.warn("云端同步后恢复歌曲待播失败，降级展示封面:", err);
-            updateCurrentSongInfo(state.currentSong, { loadArtwork: true });
-            loadLyrics(state.currentSong, state, dom, debugLog);
-        }
-    } else {
-        showAlbumCoverPlaceholder(dom, state);
-    }
-
-    return true;
-}
-
-// 手动全量同步触发器
+// 手动刷新当前账号的数据快照
 export async function handleManualCloudSync() {
-    const remoteKeys = Array.from(STORAGE_KEYS_TO_SYNC);
-    const snapshot = await persistentStorage.getItems(remoteKeys);
-    if (!snapshot || !snapshot.d1Available) {
-        throw new Error("云端 D1 数据库不可用");
-    }
-    setRemoteSyncEnabled(true);
-    const cloudData = snapshot.data;
-    const hasCloudData = cloudData && typeof cloudData === "object" && Boolean(
-        cloudData.playlistSongs || cloudData.currentSong || cloudData.favoriteSongs
-    );
-
-    if (hasCloudData) {
-        await applyPersistentSnapshotFromRemote(cloudData);
-        debugLog("手动同步：成功从 D1 恢复云端漫游数据");
-    } else {
-        syncLocalDataToCloud();
-        debugLog("手动同步：云端为空，已将本地数据同步推送至云端");
-    }
+    await refreshUserLibrary();
+    window.location.reload();
 }
-
 window.syncFromCloud = handleManualCloudSync;
 
 // 应用启动引导
@@ -1665,40 +1455,5 @@ export async function bootstrap() {
         console.warn("恢复上次搜索结果失败:", e);
     }
 
-    // 核心：异步加载云端 D1 数据漫游快照
-    try {
-        const remoteKeys = Array.from(STORAGE_KEYS_TO_SYNC);
-        const snapshot = await persistentStorage.getItems(remoteKeys);
-        if (snapshot && snapshot.d1Available) {
-            setRemoteSyncEnabled(true);
-            const cloudData = snapshot.data;
-            const hasCloudData = cloudData && typeof cloudData === "object" && Boolean(
-                cloudData.playlistSongs || cloudData.currentSong || cloudData.favoriteSongs
-            );
-
-            if (hasCloudData) {
-                debugLog("检测到 D1 云端数据库快照，正在漫游恢复播放状态与歌曲列表...");
-                await applyPersistentSnapshotFromRemote(cloudData);
-                debugLog("D1 云端数据漫游恢复完成");
-            } else if (state.playlistSongs.length > 0 || state.currentSong || state.favoriteSongs.length > 0) {
-                debugLog("D1 云端为空，正在将当前设备数据同步备份至云端...");
-                syncLocalDataToCloud();
-            }
-        }
-    } catch (e) {
-        console.warn("远程数据漫游检测失败:", e);
-    } finally {
-        if (!isRemoteSyncEnabled()) {
-            persistentStorage.checkAvailability().then((avail) => {
-                if (avail) setRemoteSyncEnabled(true);
-            });
-        }
-    }
 }
 
-// 当 DOM 就绪时启动应用
-if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bootstrap);
-} else {
-    bootstrap();
-}

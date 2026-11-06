@@ -449,11 +449,16 @@ export function removeFromPlaylist(index, state, dom, callbacks = {}) {
     showNotification("已从播放列表移除", "success", dom);
 }
 
-export function clearPlaylist(state, dom, callbacks = {}) {
+export async function clearPlaylist(state, dom, callbacks = {}) {
     if (!Array.isArray(state.playlistSongs) || state.playlistSongs.length === 0) {
         return;
     }
-
+    if (typeof callbacks.clearRemoteQueue === "function") {
+        try { await callbacks.clearRemoteQueue(); }
+        catch (error) { showNotification(error.message || "清空失败，请刷新后重试", "error", dom); return; }
+    }
+    safeSetLocalStorage("playlistSongs", "[]", { skipRemote: true });
+    safeSetLocalStorage("currentTrackIndex", "-1", { skipRemote: true });
     if (typeof callbacks.cancelPendingPlayback === "function") {
         callbacks.cancelPendingPlayback();
     }
