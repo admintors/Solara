@@ -34,7 +34,9 @@ function applyMigrations(database, migrationDir = path.join(__dirname, 'migratio
 
 function openDatabase(dbPath = DB_PATH, options = {}) {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-  const database = new DatabaseSync(dbPath, options.readOnly ? { readOnly: true } : undefined);
+  const database = options.readOnly
+    ? new DatabaseSync(dbPath, { readOnly: true })
+    : new DatabaseSync(dbPath);
   if (!options.readOnly) {
     database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     applyMigrations(database, options.migrationDir);
