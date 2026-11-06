@@ -15,7 +15,7 @@ async function importLegacy(user){
  const legacy=readLegacy(),count=legacy.queue.length+legacy.favorites.length;
  if(!count&&!Object.keys(legacy.settings).length)return false;
  if(!window.confirm('检测到此浏览器中的旧版本地数据。将 '+count+' 首歌曲及设置导入到账号“'+(user.displayName||user.username)+'”？导入只追加并跳过重复项。'))return false;
- const body={sourceType:'browser-legacy'};
+ const body={sourceType:'browser-v1'};
  if(legacy.queue.length)body.queue=legacy.queue;if(legacy.favorites.length)body.favorites=legacy.favorites;if(Object.keys(legacy.settings).length)body.settings=legacy.settings;
  await apiRequest('/api/me/import',{method:'POST',body});
  for(const key of ['playlistSongs','favoriteSongs','currentSong','currentTrackIndex','currentFavoriteIndex','currentPlaybackTime','playbackQuality','searchSource','radarSettings']){try{localStorage.removeItem(key)}catch{}}
