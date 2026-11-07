@@ -6,6 +6,11 @@ import { FAVORITE_EXPORT_VERSION } from "../constants.js";
 import { getSongKey, sanitizeImportedSong } from "./playlist.js";
 import { resetPlayerToIdle } from "../core/audio.js";
 import { showNotification } from "./settings.js";
+import { safeSetLocalStorage } from "../core/storage.js";
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' })[char]);
+}
 
 export function ensureFavoriteSongsArray(state) {
     if (!Array.isArray(state.favoriteSongs)) {
@@ -164,12 +169,14 @@ export function renderFavorites(state, dom) {
             ? song.artist.join(", ")
             : (song.artist || "未知艺术家");
         const isCurrent = state.currentList === "favorite" && index === state.currentFavoriteIndex;
-        const songKey = getSongKey(song) || `favorite-${index}`;
+        const songKey = escapeHtml(getSongKey(song) || `favorite-${index}`);
+        const songName = escapeHtml(song?.name || '未知歌曲');
+        const safeArtist = escapeHtml(artistValue);
         return `
-        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
+        <div class="playlist-item${isCurrent ? " current" : ""}" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${songName}" data-favorite-key="${songKey}">
             <div class="playlist-item-info">
-                <span class="playlist-item-title">${song.name}</span>
-                <span class="playlist-item-artist"> - ${artistValue}</span>
+                <span class="playlist-item-title">${songName}</span>
+                <span class="playlist-item-artist"> - ${safeArtist}</span>
             </div>
             <div class="playlist-item-actions" role="toolbar" aria-label="歌曲操作">
                 <button class="favorite-item-action favorite-item-action--add" type="button" data-favorite-action="add" data-index="${index}" title="添加到播放列表" aria-label="添加到播放列表">
@@ -252,7 +259,8 @@ export function removeFavoriteAtIndex(index, state, dom, callbacks = {}) {
         state.currentFavoriteIndex--;
     }
 
-    if (typeof callbacks.saveFavoriteState === "function") callbacks.saveFavoriteState();
+    safeSetLocalStorage("favoriteSongs", "[]", { skipRemote: true });
+    if (typeof callbacks.saveFavoriteState === "function") callbacks.saveFavoriteState({ skipRemote: true });
     renderFavorites(state, dom);
     if (typeof callbacks.updatePlayModeUI === "function") callbacks.updatePlayModeUI();
     if (typeof callbacks.clearLyricsIfLibraryEmpty === "function") callbacks.clearLyricsIfLibraryEmpty();
@@ -328,10 +336,12 @@ export function addAllFavoritesToPlaylist(state, dom, callbacks = {}) {
     }
 }
 
-export function clearFavorites(state, dom, callbacks = {}) {
+export async function clearFavorites(state, dom, callbacks = {}) {
     const favorites = ensureFavoriteSongsArray(state);
-    if (favorites.length === 0) {
-        return;
+    if (favorites.length === 0) return;
+    if (typeof callbacks.clearRemoteFavorites === "function") {
+        try { await callbacks.clearRemoteFavorites(); }
+        catch (error) { showNotification(error.message || "清空失败，请刷新后重试", "error", dom); return; }
     }
 
     const isPlayingFavorites = state.currentList === "favorite";

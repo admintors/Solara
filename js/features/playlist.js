@@ -62,6 +62,10 @@ export function normalizeArtistValue(value) {
     return undefined;
 }
 
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' })[char]);
+}
+
 export function getSongKey(song) {
     if (!song || typeof song !== "object") {
         return null;
@@ -225,12 +229,14 @@ export function renderPlaylist(state, dom, callbacks = {}) {
         const artistValue = Array.isArray(song.artist)
             ? song.artist.join(", ")
             : (song.artist || "未知艺术家");
-        const songKey = getSongKey(song) || `playlist-${index}`;
+        const songKey = escapeHtml(getSongKey(song) || `playlist-${index}`);
+        const songName = escapeHtml(song?.name || '未知歌曲');
+        const safeArtist = escapeHtml(artistValue);
         return `
-        <div class="playlist-item" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
+        <div class="playlist-item" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${songName}" data-favorite-key="${songKey}">
             <div class="playlist-item-info">
-                <span class="playlist-item-title">${song.name}</span>
-                <span class="playlist-item-artist"> - ${artistValue}</span>
+                <span class="playlist-item-title">${songName}</span>
+                <span class="playlist-item-artist"> - ${safeArtist}</span>
             </div>
             <div class="playlist-item-actions" role="toolbar" aria-label="歌曲操作">
                 <button class="playlist-item-favorite favorite-toggle" type="button" data-playlist-action="favorite" data-index="${index}" data-favorite-key="${songKey}" title="收藏" aria-label="收藏">
@@ -449,11 +455,16 @@ export function removeFromPlaylist(index, state, dom, callbacks = {}) {
     showNotification("已从播放列表移除", "success", dom);
 }
 
-export function clearPlaylist(state, dom, callbacks = {}) {
+export async function clearPlaylist(state, dom, callbacks = {}) {
     if (!Array.isArray(state.playlistSongs) || state.playlistSongs.length === 0) {
         return;
     }
-
+    if (typeof callbacks.clearRemoteQueue === "function") {
+        try { await callbacks.clearRemoteQueue(); }
+        catch (error) { showNotification(error.message || "清空失败，请刷新后重试", "error", dom); return; }
+    }
+    safeSetLocalStorage("playlistSongs", "[]", { skipRemote: true });
+    safeSetLocalStorage("currentTrackIndex", "-1", { skipRemote: true });
     if (typeof callbacks.cancelPendingPlayback === "function") {
         callbacks.cancelPendingPlayback();
     }

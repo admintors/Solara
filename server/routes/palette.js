@@ -11,12 +11,16 @@
 
 const { Router } = require('express');
 const path = require('path');
+const { pathToFileURL } = require('node:url');
+const dns = require('node:dns').promises;
+const https = require('node:https');
+const net = require('node:net');
 const cache = require('../cache');
 
 // jpeg-decoder.js 是 ESM 模块（export default），Node.js 需用动态 import()
 // 用一个 Promise 缓存，确保只 import 一次
 const DECODER_PATH = path.join(__dirname, '../../functions/lib/vendor/jpeg-decoder.js').replace(/\\/g, '/');
-const _decoderPromise = import(`file:///${DECODER_PATH}`).then(m => m.default || m.decode);
+const _decoderPromise = import(pathToFileURL(DECODER_PATH).href).then(m => m.default || m.decode);
 
 async function getDecoder() {
   return _decoderPromise;
@@ -25,6 +29,156 @@ async function getDecoder() {
 // ─── 常量（与 palette.ts 一致）─────────────────────────────────────────────────
 const MAX_DIMENSION = 96;
 const TARGET_SAMPLE_COUNT = 2400;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_REDIRECTS = 3;
+const MAX_IMAGE_PIXELS = 20_000_000;
+const ALLOWED_IMAGE_DOMAINS = ['music.126.net', 'kuwo.cn', 'hdslb.com', 'gtimg.cn', 'gtimg.com'];
+
+function isAllowedImageTarget(input) {
+  let url;
+  try { url = input instanceof URL ? new URL(input.toString()) : new URL(String(input)); }
+  catch { return false; }
+  const host = url.hostname.toLowerCase().replace(/\\.$/, '');
+  if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) return false;
+  return ALLOWED_IMAGE_DOMAINS.some(domain => host === domain || host.endsWith('.' + domain));
+}
+
+function isPublicAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) {
+    const parts = address.split('.').map(Number);
+    const value = parts.reduce((n, octet) => n * 256 + octet, 0);
+    const inRange = (base, bits) => Math.floor(value / (2 ** (32 - bits))) === Math.floor(base / (2 ** (32 - bits)));
+    const blocked = [[0,8],[0x0a000000,8],[0x64400000,10],[0x7f000000,8],[0xa9fe0000,16],[0xac100000,12],[0xc0000000,24],[0xc0000200,24],[0xc0586300,24],[0xc0a80000,16],[0xc6120000,15],[0xc6336400,24],[0xcb007100,24],[0xe0000000,4],[0xf0000000,4]];
+    return !blocked.some(([base,bits]) => inRange(base,bits));
+  }
+  if (family !== 6 || address.includes('%')) return false;
+  const lower = address.toLowerCase();
+  if (lower.startsWith('::ffff:')) return false;
+  const halves = lower.split('::');
+  if (halves.length > 2) return false;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const zeros = 8 - left.length - right.length;
+  if (zeros < 0 || (halves.length === 1 && zeros !== 0)) return false;
+  const groups = [...left, ...Array(zeros).fill('0'), ...right].map(value => parseInt(value || '0', 16));
+  if (groups.length !== 8 || groups.some(value => !Number.isInteger(value) || value < 0 || value > 0xffff)) return false;
+  const first = groups[0];
+  if (first < 0x2000 || first > 0x3fff) return false;
+  if (first === 0x2002 || (first === 0x2001 && (groups[1] <= 0x01ff || groups[1] === 0x0db8))) return false;
+  return true;
+}
+
+async function resolvePinnedAddress(hostname, timeoutMs) {
+  let timer;
+  const rows = await Promise.race([
+    dns.lookup(hostname, { all: true, verbatim: true }),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('IMAGE_TIMEOUT')), timeoutMs); }),
+  ]).finally(() => clearTimeout(timer));
+  if (!rows.length || rows.some(row => !isPublicAddress(row.address))) throw new Error('IMAGE_TARGET_REJECTED');
+  return rows[0];
+}
+
+function requestImageOnce(url, pinned, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(absoluteTimer);
+      callback(value);
+    };
+    const request = https.request({
+      protocol: 'https:',
+      hostname: url.hostname,
+      port: url.port || 443,
+      method: 'GET',
+      path: url.pathname + url.search,
+      servername: url.hostname,
+      agent: false,
+      lookup: (_host, _options, callback) => callback(null, pinned.address, pinned.family),
+      headers: { Accept: 'image/jpeg,image/png,image/webp', 'User-Agent': 'Solara/2' },
+    }, response => {
+      const status = response.statusCode || 502;
+      const location = response.headers.location;
+      if (status >= 300 && status < 400) {
+        response.resume();
+        finish(resolve, { status, location, headers: response.headers, buffer: null });
+        return;
+      }
+      const declaredSize = Number(response.headers['content-length'] || 0);
+      if (declaredSize > MAX_IMAGE_BYTES) {
+        response.destroy();
+        finish(reject, new Error('IMAGE_TOO_LARGE'));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        if (size > MAX_IMAGE_BYTES) {
+          response.destroy(new Error('IMAGE_TOO_LARGE'));
+          request.destroy(new Error('IMAGE_TOO_LARGE'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => finish(resolve, { status, headers: response.headers, buffer: Buffer.concat(chunks, size) }));
+      response.on('error', error => finish(reject, error));
+    });
+    const absoluteTimer = setTimeout(() => request.destroy(new Error('IMAGE_TIMEOUT')), timeoutMs);
+    request.on('error', error => finish(reject, error));
+    request.end();
+  });
+}
+
+async function fetchSafeImage(input) {
+  const deadline = Date.now() + 5000;
+  let current = input instanceof URL ? new URL(input.toString()) : new URL(String(input));
+  for (let hop = 0; hop <= MAX_IMAGE_REDIRECTS; hop++) {
+    if (!isAllowedImageTarget(current)) throw new Error('IMAGE_TARGET_REJECTED');
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('IMAGE_TIMEOUT');
+    const pinned = await resolvePinnedAddress(current.hostname, remaining);
+    const remainingAfterDns = deadline - Date.now();
+    if (remainingAfterDns <= 0) throw new Error('IMAGE_TIMEOUT');
+    const response = await requestImageOnce(current, pinned, remainingAfterDns);
+    if (response.status >= 300 && response.status < 400) {
+      if (hop === MAX_IMAGE_REDIRECTS || !response.location) throw new Error('IMAGE_REDIRECT_REJECTED');
+      current = new URL(response.location, current);
+      continue;
+    }
+    return { ...response, url: current };
+  }
+  throw new Error('IMAGE_REDIRECT_REJECTED');
+}
+
+function jpegDimensions(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+  const startOfFrame = new Set([0xc0,0xc1,0xc2,0xc3,0xc5,0xc6,0xc7,0xc9,0xca,0xcb,0xcd,0xce,0xcf]);
+  let offset = 2;
+  while (offset + 4 < buffer.length) {
+    if (buffer[offset] !== 0xff) { offset++; continue; }
+    while (buffer[offset] === 0xff) offset++;
+    const marker = buffer[offset++];
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    const length = buffer.readUInt16BE(offset);
+    if (length < 2 || offset + length > buffer.length) return null;
+    if (startOfFrame.has(marker) && length >= 7) return { height: buffer.readUInt16BE(offset + 3), width: buffer.readUInt16BE(offset + 5) };
+    offset += length;
+  }
+  return null;
+}
+
+function enforceDecodeLimit(buffer, contentType) {
+  if (!contentType.toLowerCase().startsWith('image/jpeg')) return;
+  const dimensions = jpegDimensions(buffer);
+  if (!dimensions || dimensions.width < 1 || dimensions.height < 1 ||
+      dimensions.width > 10000 || dimensions.height > 10000 ||
+      dimensions.width * dimensions.height > MAX_IMAGE_PIXELS) throw new Error('IMAGE_DIMENSION_LIMIT');
+}
+
 
 // ─── 工具函数（直接从 palette.ts 移植）────────────────────────────────────────
 
@@ -304,90 +458,52 @@ async function buildPalette(arrayBuffer, contentType) {
 
 // ─── Express 路由 ──────────────────────────────────────────────────────────────
 
-module.exports = function createPaletteRouter() {
+function createPaletteRouter() {
   const router = Router();
-
-  router.options('/', (req, res) => {
-    res.status(204).set({
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,OPTIONS',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Max-Age': '86400',
-    }).end();
-  });
 
   router.get('/', async (req, res) => {
     const imageParam = req.query.image || req.query.url;
-    if (!imageParam) {
-      return res.status(400).json({ error: 'Missing image parameter' });
-    }
-
+    if (typeof imageParam !== 'string' || imageParam.length > 4096) return res.status(400).json({ error: 'Invalid image URL' });
     let target;
-    try {
-      target = new URL(imageParam);
-    } catch {
-      return res.status(400).json({ error: 'Invalid image URL' });
-    }
+    try { target = new URL(imageParam); } catch { return res.status(400).json({ error: 'Invalid image URL' }); }
+    if (!isAllowedImageTarget(target)) return res.status(400).json({ error: 'Image source is not allowed' });
 
-    const cacheKey = `palette:v3:${target.toString()}`;
-
-    // ── Cache HIT ────────────────────────────────────────────────────────────
+    const cacheKey = 'palette:v4:' + target.toString();
     const cached = cache.get(cacheKey);
-    if (cached) {
-      return res.set({
-        'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=3600',
-        'X-Cache-Status': 'HIT',
-      }).send(cached.body);
-    }
+    if (cached) return res.set({
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'public, max-age=3600',
+      'X-Cache-Status': 'HIT',
+    }).send(cached.body);
 
-    // ── Fetch 上游图片（无 Cloudflare 专有选项）────────────────────────────────
     let upstream;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-    try {
-      upstream = await fetch(target.toString(), { signal: controller.signal });
-    } catch (err) {
-      console.error('[Palette fetch]', err);
-      return res.status(502).json({ error: 'Failed to fetch image' });
-    } finally {
-      clearTimeout(timeoutId);
+    try { upstream = await fetchSafeImage(target); }
+    catch (error) {
+      if (error.message === 'IMAGE_TARGET_REJECTED' || error.message === 'IMAGE_REDIRECT_REJECTED') return res.status(400).json({ error: 'Image source is not allowed' });
+      if (error.message === 'IMAGE_TOO_LARGE' || error.message === 'IMAGE_DIMENSION_LIMIT') return res.status(413).json({ error: 'Image exceeds processing limits' });
+      return res.status(502).json({ error: 'Image source is unavailable' });
     }
-
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({ error: `Upstream request failed with status ${upstream.status}` });
-    }
-
-    const contentType = upstream.headers.get('content-type') || '';
-    if (!contentType.startsWith('image/')) {
-      return res.status(415).json({ error: 'Unsupported content type' });
-    }
-
-    const buffer = await upstream.arrayBuffer();
+    if (upstream.status < 200 || upstream.status >= 300) return res.status(502).json({ error: 'Image source is unavailable' });
+    const contentType = String(upstream.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (!contentType.startsWith('image/')) return res.status(415).json({ error: 'Unsupported image format' });
+    try { enforceDecodeLimit(upstream.buffer, contentType); }
+    catch { return res.status(413).json({ error: 'Image exceeds processing limits' }); }
 
     try {
-      const palette = await buildPalette(buffer, contentType);
-      palette.source = target.toString();
+      const palette = await buildPalette(upstream.buffer, contentType);
+      palette.source = upstream.url.toString();
       const json = JSON.stringify(palette);
-
-      // 缓存 1 小时
       cache.set(cacheKey, { body: json, contentType: 'application/json' }, 3600);
-
       return res.set({
         'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=3600',
         'X-Cache-Status': 'MISS',
       }).send(json);
-    } catch (err) {
-      if (err.name === 'UnsupportedImageFormatError') {
-        return res.status(415).json({ error: err.message });
-      }
-      console.error('[Palette build]', err);
-      return res.status(500).json({ error: 'Failed to analyze image' });
+    } catch (error) {
+      if (error.name === 'UnsupportedImageFormatError') return res.status(415).json({ error: error.message });
+      return res.status(415).json({ error: 'Unsupported image format' });
     }
   });
-
   return router;
-};
+}
+module.exports = Object.assign(createPaletteRouter, { isAllowedImageTarget, isPublicAddress, fetchSafeImage, jpegDimensions, enforceDecodeLimit });

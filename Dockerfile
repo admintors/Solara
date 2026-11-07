@@ -1,28 +1,32 @@
-FROM node:22-slim
+FROM node:22.23.4-bookworm-slim
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="Solara Docker Multi-User" \
+      org.opencontainers.image.source="https://github.com/admintors/Solara" \
+      org.opencontainers.image.revision="${VCS_REF}"
+
+ENV APP_ENV=production \
+    NODE_ENV=production \
+    DATA_DIR=/data \
+    DB_PATH=/data/solara-multiuser.db
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY --chown=node:node . /app
+COPY --chown=node:node functions/proxy.ts /app/server/internal-proxy/functions/proxy.ts
 
-# 安装 CA 证书，确保 HTTPS 上游请求正常
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+RUN npm ci --prefix /app/server --omit=dev --ignore-scripts \
+ && npm ci --prefix /app/server/internal-proxy --omit=dev \
+ && mkdir -p /data /app/server/internal-proxy/public \
+ && rm -f /app/functions/_middleware.ts /app/functions/api/login.ts /app/functions/api/storage.ts /app/functions/palette.ts /app/functions/proxy.ts \
+ && (rmdir /app/functions/api 2>/dev/null || true) \
+ && chmod 0755 /app/docker-entrypoint.sh \
+ && chown -R node:node /app/server/internal-proxy /data \
+ && npm cache clean --force
 
-# 全局安装 wrangler（锁定大版本 3.x，避免意外 breaking change）
-# 使用 --ignore-scripts 跳过可选的原生依赖编译，加快构建速度
-RUN npm install -g wrangler@3 --ignore-scripts
-
-# 复制项目文件（server/node_modules、data、.git 等已由 .dockerignore 排除）
-COPY . .
-
-# 安装 Node.js 独立服务器的依赖
-RUN cd /app/server && npm install --ignore-scripts
-
-# 创建数据持久化目录（SQLite / D1 本地模拟文件写入此处）
-RUN mkdir -p /app/data
-
-# 确保 entrypoint 脚本可执行
-RUN chmod +x /app/docker-entrypoint.sh
-
+USER node:node
 EXPOSE 8787
-
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+ENTRYPOINT ["tini", "-g", "--", "/app/docker-entrypoint.sh"]

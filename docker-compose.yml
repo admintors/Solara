@@ -1,27 +1,47 @@
-version: '3.8'
-
 services:
   solara:
-    image: ghcr.io/akudamatata/solara:latest
+    image: solara:multi-user-v1
+    build:
+      context: .
+      args:
+        VCS_REF: ${GIT_SHA:-local}
     container_name: solara
-    restart: always
-    init: true # 解决容器停止时 Node/Wrangler 进程无法优雅响应 SIGTERM 导致卡顿的问题
+    restart: unless-stopped
+    stop_grace_period: 30s
     ports:
-      # 如无端口冲突可改为 80:8787 或 8787:8787
-      # 配合 Nginx 反向代理时，映射到 Nginx 上游端口即可（默认 8080）
-      - "8080:8787"
+      - "127.0.0.1:8080:8787"
     environment:
-      # ── 必填：登录密码（留空则关闭密码保护，任何人可访问）──────────────────
-      - PASSWORD=your_secure_password_here
-
-      # ── 可选：音乐聚合 API 地址 ────────────────────────────────────────────
-      # 当默认节点被你的服务器 IP 封锁时，可替换为以下备用地址：
-      #   https://music-api-cn.gdstudio.xyz/api.php  （国内节点）
-      #   https://music-api-hk.gdstudio.xyz/api.php  （香港节点）
-      - API_BASE_URL=https://music-api.gdstudio.xyz/api.php
-
-      # ── 可选：界面语言（默认中文，填 ENG 切换为英文）─────────────────────
-      # - language=ENG
+      APP_ENV: production
+      NODE_ENV: production
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN in .env}
+      API_BASE_URL: ${API_BASE_URL:-https://music-api.gdstudio.xyz/api.php}
+      DATA_DIR: /data
+      DB_PATH: /data/solara-multiuser.db
+      HOST: 0.0.0.0
+      PORT: 8787
+      INTERNAL_PROXY_URL: http://127.0.0.1:8788
+      SESSION_ABSOLUTE_TTL_SECONDS: ${SESSION_ABSOLUTE_TTL_SECONDS:-604800}
+      SESSION_IDLE_TTL_SECONDS: ${SESSION_IDLE_TTL_SECONDS:-172800}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      USER_API_PER_MINUTE: ${USER_API_PER_MINUTE:-120}
+      SEARCH_PER_MINUTE: ${SEARCH_PER_MINUTE:-30}
+      AUDIO_STREAMS_PER_USER: ${AUDIO_STREAMS_PER_USER:-2}
     volumes:
-      # 持久化 SQLite 数据库（收藏夹和播放记录跨重启保留）
       - ./data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
