@@ -34,7 +34,14 @@ if (!password) throw new Error('SOLARA_E2E_PASSWORD is required');
     ]);
 
     await page.locator('#solaraAccountBar').waitFor({ state: 'visible', timeout: 20000 });
-    await page.waitForFunction(() => document.documentElement.dataset.solaraAppReady === 'true', null, { timeout: 30000 });
+    await page.waitForFunction(() => {
+      const startup = document.getElementById('authStartupStatus');
+      return document.documentElement.dataset.solaraAppReady === 'true'
+        || startup?.dataset.error === 'true';
+    }, null, { timeout: 30000 });
+    const ready = await page.evaluate(() => document.documentElement.dataset.solaraAppReady === 'true');
+    const startupMessage = await page.locator('#authStartupStatus').textContent().catch(() => '');
+    assert.equal(ready, true, 'native player startup failed: ' + startupMessage + '; page errors: ' + pageErrors.join(' | '));
     assert.equal(await page.locator('#audioPlayer').count(), 1, 'native player element should remain mounted');
 
     await page.getByRole('button', { name: '恢复设备进度' }).click();
