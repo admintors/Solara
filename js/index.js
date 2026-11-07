@@ -33,9 +33,10 @@ async function start(){
    onRefresh:async()=>{await loadUserLibrary().then(data=>initializeUserStorage(session,data));location.reload()}
   });
   if(hasLegacy&&await importLegacy(session.user)){location.reload();return}
-  window.addEventListener('solara:auth-invalid',()=>{announce('登录状态已失效，正在返回登录页…');location.replace('/login')},{once:true});
+  window.addEventListener('solara:auth-invalid',event=>{announce('登录状态已变化，正在重新验证…');location.replace(event.detail?.reason==='account-changed'?'/':'/login')},{once:true});
   window.__SOLARA_IS_MOBILE=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)||window.innerWidth<760;
   const {bootstrap}=await import('./app.js');await bootstrap();
+  document.documentElement.dataset.solaraAppReady='true';
   if(window.__SOLARA_IS_MOBILE)await import('./mobile.js');
   startup?.remove();
  }catch(error){announce(error?.message||'Solara 启动失败，请刷新页面重试。',true);console.error('Solara startup failed',error)}

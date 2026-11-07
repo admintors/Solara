@@ -68,6 +68,15 @@ describe('multi-user isolation and concurrency contracts', () => {
     if (directory) fs.rmSync(directory, { recursive: true, force: true });
   });
 
+  it('redirects an unauthenticated homepage request while keeping API responses at 401', async () => {
+    const home = await fetch(origin + '/', { redirect: 'manual' });
+    assert.equal(home.status, 302);
+    assert.equal(new URL(home.headers.get('location'), origin).pathname, '/login');
+    const api = await fetch(origin + '/api/me/bootstrap', { redirect: 'manual' });
+    assert.equal(api.status, 401);
+    assert.equal((await api.json()).error.code, 'AUTH_REQUIRED');
+  });
+
   it('rejects another account ID and never exposes another user playlist', async () => {
     const created = await call(memberSession, '/api/me/playlists', { method: 'POST', body: { name: 'member-private' } });
     assert.equal(created.status, 201);

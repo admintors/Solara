@@ -88,7 +88,7 @@ function buildDialog() {
 
 async function refreshPlaylists(selectedId = '') {
   const response = await apiRequest('/api/me/playlists');
-  const playlists = (response.playlists || []).filter(item => item.kind === 'custom');
+  const playlists = (Array.isArray(response) ? response : (response.playlists || [])).filter(item => item.kind === 'custom');
   select.replaceChildren();
   const placeholder = element('option', '', playlists.length ? '选择歌单…' : '暂无命名歌单');
   placeholder.value = '';

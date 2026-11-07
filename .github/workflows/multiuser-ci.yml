@@ -42,7 +42,7 @@ jobs:
             --publish 127.0.0.1:18787:8787 \
             --env APP_ENV=development \
             --env NODE_ENV=development \
-            --env PUBLIC_ORIGIN=http://127.0.0.1:8787 \
+            --env PUBLIC_ORIGIN=http://127.0.0.1:18787 \
             --volume "$RUNNER_TEMP/solara-data:/data" \
             solara-ci:"$GITHUB_SHA"
       - name: Verify protected proxy and initialize admin
@@ -75,6 +75,21 @@ jobs:
             sleep 1
           done
           curl --fail http://127.0.0.1:18787/readyz
+      - name: Set up Node.js for browser checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4
+      - name: Install Chromium and Playwright
+        run: |
+          PLAYWRIGHT_DIR="$RUNNER_TEMP/solara-playwright"
+          mkdir -p "$PLAYWRIGHT_DIR"
+          npm install --prefix "$PLAYWRIGHT_DIR" --no-save playwright@1.65.0
+          "$PLAYWRIGHT_DIR/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Run browser checks
+        env:
+          PLAYWRIGHT_DIR: ${{ runner.temp }}/solara-playwright
+          SOLARA_E2E_PASSWORD: ci-only-test-password-2026
+        run: NODE_PATH="$PLAYWRIGHT_DIR/node_modules" node tests/browser/multiuser-smoke.cjs
       - name: Remove smoke-test container
         if: always()
         run: docker rm --force solara-ci || true

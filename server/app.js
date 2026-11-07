@@ -76,10 +76,12 @@ function createApp(options = {}) {
   }
 
   app.get('/', (req, res, next) => requireSession(req, res, error => {
+    if (error?.status === 401) return res.set('Cache-Control', 'no-store').redirect(302, '/login');
     if (error) return next(error);
     res.set('Cache-Control', 'no-store').sendFile(path.join(ROOT_DIR, 'index.html'));
   }));
   app.get('/admin', (req, res, next) => requireSession(req, res, error => {
+    if (error?.status === 401) return res.set('Cache-Control', 'no-store').redirect(302, '/login');
     if (error) return next(error);
     if (req.user.role !== 'admin') return res.status(404).send('Not Found');
     res.set('Cache-Control', 'no-store').sendFile(path.join(ROOT_DIR, 'admin.html'));

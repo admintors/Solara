@@ -3,14 +3,22 @@ import { logout, apiRequest } from './core/auth.js';
 import { getSyncStatus, getLibraryMetadata } from './core/storage.js';
 import { openNamedPlaylistManager } from './core/named-playlists.js';
 function button(label,className,handler){const element=document.createElement('button');element.type='button';element.className=className;element.textContent=label;element.addEventListener('click',handler);return element}
+function closeDialog(dialog){
+ if(typeof dialog.close==='function'&&dialog.open)dialog.close();
+ else{dialog.removeAttribute('open');dialog.dispatchEvent(new Event('close'))}
+}
 function createResumeDialog(){
- const dialog=document.createElement('dialog');dialog.className='named-playlist-dialog';
+ const dialog=document.createElement('dialog');dialog.className='named-playlist-dialog';dialog.setAttribute('aria-labelledby','solara-resume-title');
  const shell=document.createElement('div');shell.className='named-playlist-shell';
- const title=document.createElement('h2');title.textContent='恢复其他设备的进度';
- const status=document.createElement('p');status.className='named-playlist-status';status.textContent='正在读取设备…';
+ const title=document.createElement('h2');title.id='solara-resume-title';title.textContent='恢复其他设备的进度';
+ const status=document.createElement('p');status.className='named-playlist-status';status.setAttribute('role','status');status.textContent='正在读取设备…';
  const list=document.createElement('div');list.className='named-playlist-rows';
- const close=document.createElement('button');close.type='button';close.className='named-playlist-action';close.textContent='关闭';close.addEventListener('click',()=>dialog.close());
- shell.append(title,status,list,close);dialog.append(shell);document.body.append(dialog);return{dialog,status,list};
+ const close=document.createElement('button');close.type='button';close.className='named-playlist-action';close.textContent='关闭';close.addEventListener('click',()=>closeDialog(dialog));
+ shell.append(title,status,list,close);dialog.append(shell);document.body.append(dialog);
+ dialog.addEventListener('click',event=>{if(event.target===dialog)closeDialog(dialog)});
+ dialog.addEventListener('close',()=>dialog.remove(),{once:true});
+ if(typeof dialog.showModal==='function')dialog.showModal();else dialog.setAttribute('open','');
+ return{dialog,status,list};
 }
 export function mountAccountBar(user,options={}){
  const existing=document.getElementById('solaraAccountBar');if(existing)existing.remove();
@@ -34,7 +42,7 @@ export function mountAccountBar(user,options={}){
     const use=button('恢复','named-playlist-action',async()=>{
      if(!window.confirm('将此设备的播放进度恢复到当前设备？当前设备进度会被替换。'))return;
      use.disabled=true;
-     try{const metadata=getLibraryMetadata();await apiRequest('/api/me/playback/resume',{method:'POST',body:{sourceDeviceId:device.deviceId},ifMatch:'"v'+metadata.playbackVersion+'"'});view.dialog.close();location.reload()}
+     try{const metadata=getLibraryMetadata();await apiRequest('/api/me/playback/resume',{method:'POST',body:{sourceDeviceId:device.deviceId},ifMatch:'"v'+metadata.playbackVersion+'"'});closeDialog(view.dialog);location.reload()}
      catch(error){view.status.textContent=error.message||'恢复失败';use.disabled=false}
     });
     row.append(label,use);view.list.append(row);
@@ -52,7 +60,7 @@ export function mountAccountBar(user,options={}){
  window.addEventListener('solara:auth-invalid',event=>{
   if(document.getElementById('solaraAccountLock'))return;
   const lock=document.createElement('div');lock.id='solaraAccountLock';lock.className='solara-account-lock';lock.textContent='账号状态已变化，正在重新验证…';document.body.append(lock);
-  const reason=event.detail?.reason||'';window.setTimeout(()=>window.location.replace(reason==='logout'?'/login':'/'),80);
+  const reason=event.detail?.reason||'';window.setTimeout(()=>window.location.replace(reason==='logout'||reason==='session-expired'?'/login':'/'),80);
  },{once:true});
  return bar;
 }
